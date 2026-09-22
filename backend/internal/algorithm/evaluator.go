@@ -1,17 +1,21 @@
 package algorithm
+
 import (
 	"encoding/json"
+	"fermentation-kinetics-deviation-analysis/backend/internal/constants"
+	"fermentation-kinetics-deviation-analysis/backend/internal/model"
+	"fermentation-kinetics-deviation-analysis/backend/internal/timeseries"
+	"fermentation-kinetics-deviation-analysis/backend/internal/util"
 	"fmt"
 	"math"
 	"sort"
 	"strings"
 	"time"
-	"fermentation-kinetics-deviation-analysis/backend/internal/constants"
-	"fermentation-kinetics-deviation-analysis/backend/internal/model"
-	"fermentation-kinetics-deviation-analysis/backend/internal/timeseries"
-	"fermentation-kinetics-deviation-analysis/backend/internal/util"
 )
-const Version = "phase-dtw-v1.0.0"
+
+const Version = "phase-dtw-v1.1.0"
+const LegacyVersion = "phase-dtw-v1.0.0"
+
 type PhaseBoundary struct {
 	Phase     constants.FermentationPhase `json:"phase"`
 	StartHour float64                     `json:"start_hour"`
@@ -51,6 +55,32 @@ type PhaseEvidence struct {
 	WeightedDeviation float64            `json:"weighted_deviation"`
 	ChannelScores     map[string]float64 `json:"channel_scores"`
 	ObservedPoints    int                `json:"observed_points"`
+	Weight            float64            `json:"weight,omitempty"`
+}
+type IsolatedChannelReport struct {
+	Channel            string  `json:"channel"`
+	MissingRate        float64 `json:"missing_rate"`
+	IsolationThreshold float64 `json:"isolation_threshold"`
+	WeightBefore       float64 `json:"weight_before"`
+	WeightAfter        float64 `json:"weight_after"`
+}
+type IsolationPhaseReport struct {
+	Phase            string   `json:"phase"`
+	IsolatedChannels []string `json:"isolated_channels"`
+	ScoreBefore      float64  `json:"score_before"`
+	ScoreAfter       float64  `json:"score_after"`
+	WeightBefore     float64  `json:"weight_before"`
+	WeightAfter      float64  `json:"weight_after"`
+	WeightReduction  float64  `json:"weight_reduction"`
+}
+type IsolationReport struct {
+	Isolated          bool                    `json:"isolated"`
+	Threshold         float64                 `json:"isolation_threshold"`
+	IsolatedChannels  []IsolatedChannelReport `json:"isolated_channels"`
+	AffectedPhases    []IsolationPhaseReport  `json:"affected_phases"`
+	OverallBefore     float64                 `json:"overall_score_before"`
+	OverallAfter      float64                 `json:"overall_score_after"`
+	EffectiveChannels []string                `json:"effective_channels"`
 }
 type AlignedPoint struct {
 	Phase                string  `json:"phase"`
@@ -65,10 +95,12 @@ type Result struct {
 	DeviationLevel      constants.DeviationLevel
 	AlignedCurveJSON    string
 	SuspectedCausesJSON string
+	IsolationJSON       string
 	Explanation         string
 	OverallScore        float64
 }
 type Evaluator struct{}
+
 func NewEvaluator() *Evaluator { return &Evaluator{} }
 func NewSnapshot(series model.SensorSeries, recipe model.CultureRecipe) Snapshot {
 	return Snapshot{
@@ -93,11 +125,12 @@ func DecodeSnapshot(raw string) (Snapshot, error) {
 	if err := json.Unmarshal([]byte(raw), &snapshot); err != nil {
 		return Snapshot{}, fmt.Errorf("decode analysis snapshot: %w", err)
 	}
-	if snapshot.AlgorithmVersion != Version {
+	if !SupportedVersion(snapshot.AlgorithmVersion) {
 		return Snapshot{}, fmt.Errorf("snapshot algorithm %s is not supported by %s", snapshot.AlgorithmVersion, Version)
 	}
 	return snapshot, nil
 }
+func SupportedVersion(version string) bool { return version == Version || version == LegacyVersion }
 func ValidateRecipeConfiguration(boundariesRaw, curvesRaw, toleranceRaw []byte, targetDuration float64) error {
 	boundaries, curves, tolerances, err := parseConfiguration(boundariesRaw, curvesRaw, toleranceRaw)
 	if err != nil {
@@ -148,48 +181,106 @@ func ValidateRecipeConfiguration(boundariesRaw, curvesRaw, toleranceRaw []byte, 
 	return nil
 }
 func (e *Evaluator) Evaluate(snapshot Snapshot) (Result, error) {
-	if snapshot.AlgorithmVersion != Version {
+	switch snapshot.AlgorithmVersion {
+	case Version:
+		return evaluate(snapshot)
+	case LegacyVersion:
+		return evaluateLegacy(snapshot)
+	default:
 		return Result{}, fmt.Errorf("unsupported algorithm version %q", snapshot.AlgorithmVersion)
 	}
+}
+func decodeEvaluation(snapshot Snapshot) (
+	[]timeseries.Point, []PhaseBoundary, map[string][]CurvePoint, map[string]ChannelTolerance, error,
+) {
 	points, err := timeseries.DecodePoints(snapshot.PointsJSON)
 	if err != nil {
-		return Result{}, err
+		return nil, nil, nil, nil, err
 	}
 	boundaries, references, tolerances, err := parseConfiguration(
 		[]byte(snapshot.PhaseBoundariesJSON), []byte(snapshot.ReferenceCurvesJSON), []byte(snapshot.ToleranceProfileJSON),
 	)
 	if err != nil {
-		return Result{}, err
+		return nil, nil, nil, nil, err
 	}
+	return points, boundaries, references, tolerances, nil
+}
+func runPhases(
+	points []timeseries.Point,
+	startedAt time.Time,
+	boundaries []PhaseBoundary,
+	references map[string][]CurvePoint,
+	tolerances map[string]ChannelTolerance,
+	excluded map[string]bool,
+) ([]PhaseEvidence, []AlignedPoint, map[string]string, []float64, error) {
 	evidence := make([]PhaseEvidence, 0, len(boundaries))
 	aligned := make([]AlignedPoint, 0, len(points)*2)
 	causes := make(map[string]string)
-	overallWeighted, overallWeight := 0.0, 0.0
+	weights := make([]float64, 0, len(boundaries))
 	for _, boundary := range boundaries {
 		phaseEvidence, phaseAligned, phaseCauses, weight, phaseErr := evaluatePhase(
-			points, snapshot.StartedAt, boundary, references, tolerances,
+			points, startedAt, boundary, references, tolerances, excluded,
 		)
 		if phaseErr != nil {
-			return Result{}, phaseErr
+			return nil, nil, nil, nil, phaseErr
+		}
+		if excluded != nil {
+			phaseEvidence.Weight = round6(weight)
 		}
 		evidence = append(evidence, phaseEvidence)
 		aligned = append(aligned, phaseAligned...)
 		for key, cause := range phaseCauses {
 			causes[key] = cause
 		}
-		overallWeighted += phaseEvidence.WeightedDeviation * weight
-		overallWeight += weight
+		weights = append(weights, weight)
+	}
+	return evidence, aligned, causes, weights, nil
+}
+func overallFromPhases(evidence []PhaseEvidence, weights []float64) (float64, error) {
+	overallWeighted, overallWeight := 0.0, 0.0
+	for i, phaseEvidence := range evidence {
+		overallWeighted += phaseEvidence.WeightedDeviation * weights[i]
+		overallWeight += weights[i]
 	}
 	if overallWeight == 0 {
-		return Result{}, fmt.Errorf("no comparable channel observations were found")
+		return 0, fmt.Errorf("no comparable channel observations were found")
 	}
-	overall := clamp(overallWeighted / overallWeight)
-	level := constants.DeviationLevelForScore(overall)
+	return clamp(overallWeighted / overallWeight), nil
+}
+func sortedCauseList(causes map[string]string) []string {
 	causeList := make([]string, 0, len(causes))
 	for _, cause := range causes {
 		causeList = append(causeList, cause)
 	}
 	sort.Strings(causeList)
+	return causeList
+}
+func legacyExplanation(overall float64, phaseCount int) string {
+	return fmt.Sprintf(
+		"Deterministic phase-constrained DTW produced an overall deviation of %.3f (%s) across %d phases. "+
+			"Long gaps and missing values remain explicit; this result supports offline review only and contains no equipment control instructions.",
+		overall, constants.DeviationLevelForScore(overall), phaseCount,
+	)
+}
+func evaluateLegacy(snapshot Snapshot) (Result, error) {
+	points, boundaries, references, tolerances, err := decodeEvaluation(snapshot)
+	if err != nil {
+		return Result{}, err
+	}
+	evidence, aligned, causes, weights, err := runPhases(points, snapshot.StartedAt, boundaries, references, tolerances, nil)
+	if err != nil {
+		return Result{}, err
+	}
+	overall, err := overallFromPhases(evidence, weights)
+	if err != nil {
+		return Result{}, err
+	}
+	return buildResult(evidence, aligned, sortedCauseList(causes), overall, "",
+		legacyExplanation(overall, len(evidence)))
+}
+func buildResult(
+	evidence []PhaseEvidence, aligned []AlignedPoint, causeList []string, overall float64, isolationJSON, explanation string,
+) (Result, error) {
 	phaseJSON, err := json.Marshal(evidence)
 	if err != nil {
 		return Result{}, fmt.Errorf("encode phase evidence: %w", err)
@@ -202,14 +293,10 @@ func (e *Evaluator) Evaluate(snapshot Snapshot) (Result, error) {
 	if err != nil {
 		return Result{}, fmt.Errorf("encode suspected causes: %w", err)
 	}
-	explanation := fmt.Sprintf(
-		"Deterministic phase-constrained DTW produced an overall deviation of %.3f (%s) across %d phases. "+
-			"Long gaps and missing values remain explicit; this result supports offline review only and contains no equipment control instructions.",
-		overall, level, len(evidence),
-	)
 	return Result{
-		PhaseScoresJSON: string(phaseJSON), DeviationLevel: level, AlignedCurveJSON: string(alignedJSON),
-		SuspectedCausesJSON: string(causesJSON), Explanation: explanation, OverallScore: overall,
+		PhaseScoresJSON: string(phaseJSON), DeviationLevel: constants.DeviationLevelForScore(overall),
+		AlignedCurveJSON: string(alignedJSON), SuspectedCausesJSON: string(causesJSON),
+		IsolationJSON: isolationJSON, Explanation: explanation, OverallScore: overall,
 	}, nil
 }
 func parseConfiguration(boundariesRaw, curvesRaw, toleranceRaw []byte) (
@@ -238,6 +325,7 @@ func evaluatePhase(
 	boundary PhaseBoundary,
 	references map[string][]CurvePoint,
 	tolerances map[string]ChannelTolerance,
+	excluded map[string]bool,
 ) (PhaseEvidence, []AlignedPoint, map[string]string, float64, error) {
 	evidence := PhaseEvidence{Phase: string(boundary.Phase), ChannelScores: map[string]float64{}}
 	aligned := []AlignedPoint{}
@@ -246,6 +334,9 @@ func evaluatePhase(
 	durationScores, slopeScores, peakScores, distanceScores := []float64{}, []float64{}, []float64{}, []float64{}
 	channels := make([]string, 0, len(references))
 	for channel := range references {
+		if excluded[channel] {
+			continue
+		}
 		channels = append(channels, channel)
 	}
 	sort.Strings(channels)

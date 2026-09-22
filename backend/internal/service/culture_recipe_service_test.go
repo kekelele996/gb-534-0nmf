@@ -86,15 +86,19 @@ func testRecipeConfig(t *testing.T) (json.RawMessage, json.RawMessage, json.RawM
 	if err != nil {
 		t.Fatal(err)
 	}
-	curves := map[string][]algorithm.CurvePoint{"ph": {}}
+	curves := map[string][]algorithm.CurvePoint{"ph": {}, "temperature": {}}
 	for hour := 0; hour <= 8; hour++ {
 		curves["ph"] = append(curves["ph"], algorithm.CurvePoint{ElapsedHour: float64(hour), Value: 7 - float64(hour)*0.05})
+		curves["temperature"] = append(curves["temperature"], algorithm.CurvePoint{ElapsedHour: float64(hour), Value: 29.5 + 0.04*float64(hour)})
 	}
 	references, err := json.Marshal(curves)
 	if err != nil {
 		t.Fatal(err)
 	}
-	tolerances, err := json.Marshal(map[string]algorithm.ChannelTolerance{"ph": {Weight: 1, MaxDistance: 1}})
+	tolerances, err := json.Marshal(map[string]algorithm.ChannelTolerance{
+		"ph":          {Weight: 1, MaxDistance: 1},
+		"temperature": {Weight: 1, MaxDistance: 1},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

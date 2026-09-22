@@ -11,6 +11,32 @@ export interface PhaseScore {
   weighted_deviation: number
   channel_scores: Record<string, number>
   observed_points: number
+  weight?: number
+}
+export interface IsolatedChannel {
+  channel: string
+  missing_rate: number
+  isolation_threshold: number
+  weight_before: number
+  weight_after: number
+}
+export interface IsolationPhase {
+  phase: string
+  isolated_channels: string[]
+  score_before: number
+  score_after: number
+  weight_before: number
+  weight_after: number
+  weight_reduction: number
+}
+export interface IsolationReport {
+  isolated: boolean
+  isolation_threshold: number
+  isolated_channels: IsolatedChannel[]
+  affected_phases: IsolationPhase[]
+  overall_score_before: number
+  overall_score_after: number
+  effective_channels: string[]
 }
 export interface AlignedPoint {
   phase: string
@@ -31,6 +57,7 @@ export interface DeviationAnalysis {
   deviation_level: DeviationLevel
   aligned_curve_json: AlignedPoint[]
   suspected_causes_json: string[]
+  isolation_json?: IsolationReport | null
   analysis_state: AnalysisState
   explanation: string
   analyzed_at: string

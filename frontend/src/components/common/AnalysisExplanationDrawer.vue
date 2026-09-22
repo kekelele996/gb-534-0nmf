@@ -2,12 +2,14 @@
 import { computed } from 'vue'
 import { FileSearch, X } from 'lucide-vue-next'
 import type { DeviationAnalysis } from '../../types/deviation-analysis'
+import ChannelIsolationPanel from './ChannelIsolationPanel.vue'
 import DeviationBadge from './DeviationBadge.vue'
 import PhaseBadge from './PhaseBadge.vue'
 
 const props = defineProps<{ modelValue: boolean; analysis: DeviationAnalysis | null }>()
 const emit = defineEmits<{ 'update:modelValue': [value: boolean] }>()
 const scores = computed(() => props.analysis?.phase_scores_json ?? [])
+const isolation = computed(() => props.analysis?.isolation_json ?? null)
 </script>
 <template>
   <el-drawer :model-value="modelValue" size="min(680px, 94vw)" :with-header="false" @close="emit('update:modelValue', false)">
@@ -17,6 +19,7 @@ const scores = computed(() => props.analysis?.phase_scores_json ?? [])
     </div>
     <template v-if="analysis">
       <div class="explanation-lead"><DeviationBadge :level="analysis.deviation_level" /><p>{{ analysis.explanation }}</p></div>
+      <ChannelIsolationPanel :report="isolation" compact />
       <section class="drawer-section">
         <h3>阶段证据</h3>
         <div v-for="score in scores" :key="score.phase" class="phase-evidence">

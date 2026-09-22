@@ -4,6 +4,7 @@ import { ElMessage } from 'element-plus'
 import { CheckCircle2, FileSearch, Play, RefreshCw, RotateCcw, SearchCheck } from 'lucide-vue-next'
 import AnalysisExplanationDrawer from '../components/common/AnalysisExplanationDrawer.vue'
 import AppShell from '../components/common/AppShell.vue'
+import ChannelIsolationPanel from '../components/common/ChannelIsolationPanel.vue'
 import DeviationBadge from '../components/common/DeviationBadge.vue'
 import KineticsChart from '../components/common/KineticsChart.vue'
 import PageHeader from '../components/common/PageHeader.vue'
@@ -22,6 +23,7 @@ const runner = useAnalysisRun()
 const drawer = ref(false)
 const reviewComment = ref('')
 const canSelfConfirm = computed(() => analyses.selected?.initiated_by !== auth.user?.id)
+const isolation = computed(() => analyses.selected?.isolation_json ?? null)
 
 async function run() {
   try { await runner.run(); ElMessage.success('分析已完成或返回现有幂等结果') }
@@ -74,6 +76,15 @@ onMounted(async () => { await Promise.all([series.load(), analyses.load()]); run
               <el-tooltip v-if="canRunAnalysis" content="重放冻结输入"><el-button circle aria-label="重放分析" @click="replay"><RotateCcw :size="17" /></el-button></el-tooltip>
             </div>
             <KineticsChart :aligned="analyses.selected.aligned_curve_json" :height="380" />
+            <el-alert
+              v-if="isolation?.isolated"
+              type="warning"
+              :closable="false"
+              show-icon
+              title="本次分析触发通道隔离"
+              :description="`${isolation.isolated_channels.map((item) => item.channel).join('、')} 缺失率超过 ${(isolation.isolation_threshold * 100).toFixed(0)}%，阶段权重已按 ${isolation.effective_channels.join('、')} 重新计算；隔离前阶段分与权重保留如下。`"
+            />
+            <ChannelIsolationPanel :report="isolation" />
             <div class="phase-score-grid">
               <article v-for="score in analyses.selected.phase_scores_json" :key="score.phase">
                 <PhaseBadge :phase="score.phase" />

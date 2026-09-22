@@ -13,6 +13,7 @@ type DeviationAnalysis struct {
 	DeviationLevel       string       `gorm:"size:24;not null;index" json:"deviation_level"`
 	AlignedCurveJSON     string       `gorm:"type:text;not null" json:"aligned_curve_json"`
 	SuspectedCausesJSON  string       `gorm:"type:text;not null" json:"suspected_causes_json"`
+	IsolationJSON        string       `gorm:"type:text;not null" json:"isolation_json"`
 	AnalysisState        string       `gorm:"size:24;not null;index" json:"analysis_state"`
 	Explanation          string       `gorm:"type:text;not null" json:"explanation"`
 	AnalyzedAt           time.Time    `gorm:"not null" json:"analyzed_at"`
