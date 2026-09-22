@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { CheckCircle2, FileSearch, Play, RefreshCw, RotateCcw, SearchCheck } from 'lucide-vue-next'
+import { AlertTriangle, CheckCircle2, FileSearch, Play, RefreshCw, RotateCcw, SearchCheck } from 'lucide-vue-next'
 import AnalysisExplanationDrawer from '../components/common/AnalysisExplanationDrawer.vue'
 import AppShell from '../components/common/AppShell.vue'
 import DeviationBadge from '../components/common/DeviationBadge.vue'
@@ -13,7 +13,7 @@ import { useAnalysisRun } from '../hooks/useAnalysisRun'
 import { useAuth } from '../hooks/useAuth'
 import { useAnalysisStore } from '../stores/deviation-analysis'
 import { useSeriesStore } from '../stores/sensor-series'
-import type { AnalysisState } from '../types/deviation-analysis'
+import type { AnalysisState, PhaseWeightChange } from '../types/deviation-analysis'
 
 const analyses = useAnalysisStore()
 const series = useSeriesStore()
@@ -22,6 +22,12 @@ const runner = useAnalysisRun()
 const drawer = ref(false)
 const reviewComment = ref('')
 const canSelfConfirm = computed(() => analyses.selected?.initiated_by !== auth.user?.id)
+const isolation = computed(() => analyses.selected?.isolation_report_json ?? null)
+const isolatedChannels = computed(() => isolation.value?.isolated_channels ?? [])
+const affectedPhaseChanges = computed<PhaseWeightChange[]>(
+  () => (isolation.value?.phase_weight_changes ?? []).filter((change) => change.isolated_channels.length > 0),
+)
+const asPercent = (value: number) => `${(value * 100).toFixed(1)}%`
 
 async function run() {
   try { await runner.run(); ElMessage.success('分析已完成或返回现有幂等结果') }
@@ -74,6 +80,58 @@ onMounted(async () => { await Promise.all([series.load(), analyses.load()]); run
               <el-tooltip v-if="canRunAnalysis" content="重放冻结输入"><el-button circle aria-label="重放分析" @click="replay"><RotateCcw :size="17" /></el-button></el-tooltip>
             </div>
             <KineticsChart :aligned="analyses.selected.aligned_curve_json" :height="380" />
+            <el-alert
+              v-if="isolatedChannels.length"
+              type="warning"
+              :closable="false"
+              show-icon
+              class="isolation-alert"
+            >
+              <template #title>
+                <span class="isolation-title">
+                  <AlertTriangle :size="16" />
+                  通道隔离已生效：{{ isolatedChannels.map((item) => item.channel).join('、') }}
+                </span>
+              </template>
+              <template #default>
+                缺失率超过 {{ asPercent(isolation?.threshold ?? 0.2) }} 的通道被隔离，阶段权重已按剩余
+                {{ isolation?.effective_channel_count }} 个有效通道重算；隔离前后阶段分与权重变化保留如下。
+              </template>
+            </el-alert>
+            <section v-if="isolatedChannels.length" class="isolation-panel">
+              <div class="section-heading"><div><h2>通道隔离与降权复算</h2><p>受影响阶段、隔离通道和降权比例</p></div></div>
+              <div class="isolation-grid">
+                <article v-for="channel in isolatedChannels" :key="channel.channel" class="isolation-card">
+                  <header><strong>{{ channel.channel }}</strong><el-tag type="warning" size="small">已隔离</el-tag></header>
+                  <dl>
+                    <div><dt>缺失率</dt><dd>{{ asPercent(channel.missing_rate) }}</dd></div>
+                    <div><dt>权重变化</dt><dd>{{ channel.weight_before.toFixed(2) }} → {{ channel.weight_after.toFixed(2) }}</dd></div>
+                    <div><dt>降权比例</dt><dd class="warning-text">−{{ asPercent(channel.weight_reduction) }}</dd></div>
+                  </dl>
+                  <p class="muted"><small>受影响阶段：{{ channel.affected_phases.join('、') || '—' }}</small></p>
+                </article>
+              </div>
+              <table class="reweight-table">
+                <thead>
+                  <tr><th>受影响阶段</th><th>隔离通道</th><th>阶段权重</th><th>降权比例</th><th>隔离前阶段分</th><th>隔离后阶段分</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="change in affectedPhaseChanges" :key="change.phase">
+                    <td><PhaseBadge :phase="change.phase" /></td>
+                    <td>{{ change.isolated_channels.join('、') }}</td>
+                    <td>{{ change.weight_before.toFixed(2) }} → {{ change.weight_after.toFixed(2) }}</td>
+                    <td class="warning-text">−{{ asPercent(change.weight_reduction) }}</td>
+                    <td>{{ asPercent(change.score_before) }}</td>
+                    <td><strong>{{ asPercent(change.score_after) }}</strong></td>
+                  </tr>
+                </tbody>
+              </table>
+              <p class="muted isolation-overall">
+                总阶段分：{{ asPercent(isolation?.overall_score_before ?? 0) }} →
+                <strong>{{ asPercent(isolation?.overall_score_after ?? 0) }}</strong>
+                （剩余 {{ isolation?.effective_channel_count }} 个有效通道）
+              </p>
+            </section>
             <div class="phase-score-grid">
               <article v-for="score in analyses.selected.phase_scores_json" :key="score.phase">
                 <PhaseBadge :phase="score.phase" />

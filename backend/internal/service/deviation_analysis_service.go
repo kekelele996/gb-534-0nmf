@@ -84,7 +84,8 @@ func (s *DeviationAnalysisService) Run(
 		SensorSeriesID: series.ID, RecipeID: recipe.ID, RecipeVersion: recipe.Version,
 		AlgorithmVersion: algorithm.Version, InputHash: inputHash, InputSnapshot: snapshotJSON,
 		PhaseScoresJSON: "[]", DeviationLevel: string(constants.DeviationNormal),
-		AlignedCurveJSON: "[]", SuspectedCausesJSON: "[]", AnalysisState: string(constants.AnalysisQueued),
+		AlignedCurveJSON: "[]", SuspectedCausesJSON: "[]", IsolationReportJSON: "{}",
+		AnalysisState: string(constants.AnalysisQueued),
 		Explanation: "Analysis is queued.", AnalyzedAt: now, InitiatedBy: actor.UserID,
 		InitiatedByName: actor.Username, IdempotencyKey: idempotencyKey, CreatedAt: now, UpdatedAt: now,
 	}
@@ -112,6 +113,7 @@ func (s *DeviationAnalysisService) Run(
 	changed, err = s.analyses.Complete(ctx, analysis.ID, map[string]any{
 		"phase_scores_json": result.PhaseScoresJSON, "deviation_level": string(result.DeviationLevel),
 		"aligned_curve_json": result.AlignedCurveJSON, "suspected_causes_json": result.SuspectedCausesJSON,
+		"isolation_report_json": result.IsolationReportJSON,
 		"explanation": result.Explanation, "analyzed_at": s.now(), "duration_milliseconds": duration,
 	})
 	if err != nil {
@@ -225,6 +227,7 @@ func (s *DeviationAnalysisService) Replay(
 		string(result.DeviationLevel) == analysis.DeviationLevel &&
 		result.AlignedCurveJSON == analysis.AlignedCurveJSON &&
 		result.SuspectedCausesJSON == analysis.SuspectedCausesJSON &&
+		result.IsolationReportJSON == analysis.IsolationReportJSON &&
 		result.Explanation == analysis.Explanation
 	if err := s.analyses.SetReplayVerified(ctx, id, passed); err != nil {
 		return dto.DeviationAnalysisResponse{}, util.WrapError(http.StatusInternalServerError, util.CodeInternal, "unable to store replay evidence", err)

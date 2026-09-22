@@ -11,7 +11,15 @@ import (
 	"fermentation-kinetics-deviation-analysis/backend/internal/timeseries"
 	"fermentation-kinetics-deviation-analysis/backend/internal/util"
 )
-const Version = "phase-dtw-v1.0.0"
+const Version = "phase-dtw-v1.1.0"
+const (
+	// ChannelIsolationThreshold is the global missing rate above which a channel is
+	// quarantined for the whole analysis rather than being allowed to dominate it.
+	ChannelIsolationThreshold = 0.20
+	// MinimumEffectiveChannels is the smallest number of non-isolated channels
+	// that must remain for an analysis to be accepted.
+	MinimumEffectiveChannels = 2
+)
 type PhaseBoundary struct {
 	Phase     constants.FermentationPhase `json:"phase"`
 	StartHour float64                     `json:"start_hour"`
@@ -52,6 +60,40 @@ type PhaseEvidence struct {
 	ChannelScores     map[string]float64 `json:"channel_scores"`
 	ObservedPoints    int                `json:"observed_points"`
 }
+type IsolatedChannel struct {
+	Channel           string  `json:"channel"`
+	MissingRate       float64 `json:"missing_rate"`
+	WeightBefore      float64 `json:"weight_before"`
+	WeightAfter       float64 `json:"weight_after"`
+	WeightReduction   float64 `json:"weight_reduction"`
+	AffectedPhases    []string `json:"affected_phases"`
+}
+type PhaseWeightChange struct {
+	Phase             string   `json:"phase"`
+	WeightBefore      float64  `json:"weight_before"`
+	WeightAfter       float64  `json:"weight_after"`
+	WeightReduction   float64  `json:"weight_reduction"`
+	ScoreBefore       float64  `json:"score_before"`
+	ScoreAfter        float64  `json:"score_after"`
+	IsolatedChannels  []string `json:"isolated_channels"`
+}
+type IsolationReport struct {
+	Threshold            float64              `json:"threshold"`
+	IsolatedChannels     []IsolatedChannel    `json:"isolated_channels"`
+	EffectiveChannelCount int                 `json:"effective_channel_count"`
+	AffectedPhases       []string             `json:"affected_phases"`
+	PhaseWeightChanges   []PhaseWeightChange  `json:"phase_weight_changes"`
+	OverallScoreBefore   float64              `json:"overall_score_before"`
+	OverallScoreAfter    float64              `json:"overall_score_after"`
+}
+type phaseRun struct {
+	evidence       []PhaseEvidence
+	aligned        []AlignedPoint
+	causes         map[string]string
+	phaseWeights   map[string]float64
+	channelWeights map[string]map[string]float64
+	overall        float64
+}
 type AlignedPoint struct {
 	Phase                string  `json:"phase"`
 	Channel              string  `json:"channel"`
@@ -65,6 +107,7 @@ type Result struct {
 	DeviationLevel      constants.DeviationLevel
 	AlignedCurveJSON    string
 	SuspectedCausesJSON string
+	IsolationReportJSON string
 	Explanation         string
 	OverallScore        float64
 }
@@ -161,40 +204,63 @@ func (e *Evaluator) Evaluate(snapshot Snapshot) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	evidence := make([]PhaseEvidence, 0, len(boundaries))
-	aligned := make([]AlignedPoint, 0, len(points)*2)
-	causes := make(map[string]string)
-	overallWeighted, overallWeight := 0.0, 0.0
-	for _, boundary := range boundaries {
-		phaseEvidence, phaseAligned, phaseCauses, weight, phaseErr := evaluatePhase(
-			points, snapshot.StartedAt, boundary, references, tolerances,
+	channelOrder := sortedReferenceChannels(references)
+	// First pass: every configured reference channel participates. A missing channel
+	// makes the whole analysis unusable rather than being silently skipped.
+	before, err := runPhases(points, snapshot.StartedAt, boundaries, references, tolerances, channelOrder, nil)
+	if err != nil {
+		return Result{}, err
+	}
+	missingRates := channelMissingRates(points, channelOrder)
+	isolated := make(map[string]struct{})
+	for _, channel := range channelOrder {
+		if missingRates[channel] > ChannelIsolationThreshold {
+			isolated[channel] = struct{}{}
+		}
+	}
+	report := IsolationReport{
+		Threshold: ChannelIsolationThreshold, IsolatedChannels: []IsolatedChannel{},
+		AffectedPhases: []string{}, PhaseWeightChanges: []PhaseWeightChange{},
+		OverallScoreBefore: round6(before.overall), EffectiveChannelCount: len(channelOrder) - len(isolated),
+	}
+	if len(channelOrder)-len(isolated) < MinimumEffectiveChannels {
+		names := make([]string, 0, len(isolated))
+		for channel := range isolated {
+			names = append(names, channel)
+		}
+		sort.Strings(names)
+		return Result{}, fmt.Errorf(
+			"channel isolation leaves %d effective channels (minimum %d); isolated channels: %s",
+			len(channelOrder)-len(isolated), MinimumEffectiveChannels, strings.Join(names, ", "),
 		)
-		if phaseErr != nil {
-			return Result{}, phaseErr
-		}
-		evidence = append(evidence, phaseEvidence)
-		aligned = append(aligned, phaseAligned...)
-		for key, cause := range phaseCauses {
-			causes[key] = cause
-		}
-		overallWeighted += phaseEvidence.WeightedDeviation * weight
-		overallWeight += weight
 	}
-	if overallWeight == 0 {
-		return Result{}, fmt.Errorf("no comparable channel observations were found")
+	// Second pass: quarantined channels are dropped and phase weights are recomputed
+	// from the remaining effective channels. Every phase must still carry evidence.
+	after := before
+	if len(isolated) > 0 {
+		after, err = runPhases(points, snapshot.StartedAt, boundaries, references, tolerances, channelOrder, isolated)
+		if err != nil {
+			return Result{}, err
+		}
+		report.PhaseWeightChanges, report.AffectedPhases = buildPhaseWeightChanges(boundaries, before, after, isolated)
+		report.IsolatedChannels = buildIsolatedChannels(channelOrder, isolated, missingRates, before, after)
+	} else {
+		changes, _ := buildPhaseWeightChanges(boundaries, before, before, nil)
+		report.PhaseWeightChanges = changes
 	}
-	overall := clamp(overallWeighted / overallWeight)
+	report.OverallScoreAfter = round6(after.overall)
+	overall := after.overall
 	level := constants.DeviationLevelForScore(overall)
-	causeList := make([]string, 0, len(causes))
-	for _, cause := range causes {
+	causeList := make([]string, 0, len(after.causes))
+	for _, cause := range after.causes {
 		causeList = append(causeList, cause)
 	}
 	sort.Strings(causeList)
-	phaseJSON, err := json.Marshal(evidence)
+	phaseJSON, err := json.Marshal(after.evidence)
 	if err != nil {
 		return Result{}, fmt.Errorf("encode phase evidence: %w", err)
 	}
-	alignedJSON, err := json.Marshal(aligned)
+	alignedJSON, err := json.Marshal(after.aligned)
 	if err != nil {
 		return Result{}, fmt.Errorf("encode aligned curve: %w", err)
 	}
@@ -202,15 +268,185 @@ func (e *Evaluator) Evaluate(snapshot Snapshot) (Result, error) {
 	if err != nil {
 		return Result{}, fmt.Errorf("encode suspected causes: %w", err)
 	}
-	explanation := fmt.Sprintf(
-		"Deterministic phase-constrained DTW produced an overall deviation of %.3f (%s) across %d phases. "+
-			"Long gaps and missing values remain explicit; this result supports offline review only and contains no equipment control instructions.",
-		overall, level, len(evidence),
-	)
+	isolationJSON, err := json.Marshal(report)
+	if err != nil {
+		return Result{}, fmt.Errorf("encode channel isolation report: %w", err)
+	}
+	explanation := buildExplanation(overall, level, len(after.evidence), report)
 	return Result{
 		PhaseScoresJSON: string(phaseJSON), DeviationLevel: level, AlignedCurveJSON: string(alignedJSON),
-		SuspectedCausesJSON: string(causesJSON), Explanation: explanation, OverallScore: overall,
+		SuspectedCausesJSON: string(causesJSON), IsolationReportJSON: string(isolationJSON),
+		Explanation: explanation, OverallScore: overall,
 	}, nil
+}
+func runPhases(
+	points []timeseries.Point,
+	startedAt time.Time,
+	boundaries []PhaseBoundary,
+	references map[string][]CurvePoint,
+	tolerances map[string]ChannelTolerance,
+	channelOrder []string,
+	excluded map[string]struct{},
+) (phaseRun, error) {
+	run := phaseRun{
+		evidence: make([]PhaseEvidence, 0, len(boundaries)), aligned: []AlignedPoint{},
+		causes:       map[string]string{},
+		phaseWeights: map[string]float64{}, channelWeights: map[string]map[string]float64{},
+	}
+	overallWeighted, overallWeight := 0.0, 0.0
+	for _, boundary := range boundaries {
+		phaseEvidence, phaseAligned, phaseCauses, weight, channelWeights, phaseErr := evaluatePhase(
+			points, startedAt, boundary, references, tolerances, channelOrder, excluded,
+		)
+		if phaseErr != nil {
+			return phaseRun{}, phaseErr
+		}
+		phase := string(boundary.Phase)
+		run.evidence = append(run.evidence, phaseEvidence)
+		run.aligned = append(run.aligned, phaseAligned...)
+		for key, cause := range phaseCauses {
+			run.causes[key] = cause
+		}
+		run.phaseWeights[phase] = weight
+		run.channelWeights[phase] = channelWeights
+		overallWeighted += phaseEvidence.WeightedDeviation * weight
+		overallWeight += weight
+	}
+	if overallWeight == 0 {
+		return phaseRun{}, fmt.Errorf("no comparable channel observations were found")
+	}
+	run.overall = clamp(overallWeighted / overallWeight)
+	return run, nil
+}
+func sortedReferenceChannels(references map[string][]CurvePoint) []string {
+	channels := make([]string, 0, len(references))
+	for channel := range references {
+		channels = append(channels, channel)
+	}
+	sort.Strings(channels)
+	return channels
+}
+func channelMissingRates(points []timeseries.Point, channels []string) map[string]float64 {
+	rates := make(map[string]float64, len(channels))
+	if len(points) == 0 {
+		return rates
+	}
+	for _, channel := range channels {
+		missing := 0
+		for _, point := range points {
+			value, ok := point.Values[channel]
+			if !ok || value == nil {
+				missing++
+			}
+		}
+		rates[channel] = float64(missing) / float64(len(points))
+	}
+	return rates
+}
+func buildIsolatedChannels(
+	channelOrder []string,
+	isolated map[string]struct{},
+	missingRates map[string]float64,
+	before, after phaseRun,
+) []IsolatedChannel {
+	result := make([]IsolatedChannel, 0, len(isolated))
+	for _, channel := range channelOrder {
+		if _, ok := isolated[channel]; !ok {
+			continue
+		}
+		entry := IsolatedChannel{
+			Channel: channel, MissingRate: round6(missingRates[channel]),
+			WeightBefore: round6(totalChannelWeight(before, channel)),
+			WeightAfter:  round6(totalChannelWeight(after, channel)),
+			AffectedPhases: []string{},
+		}
+		entry.WeightReduction = round6(weightReductionRatio(entry.WeightBefore, entry.WeightAfter))
+		for _, evidence := range before.evidence {
+			if _, scored := evidence.ChannelScores[channel]; scored {
+				entry.AffectedPhases = append(entry.AffectedPhases, evidence.Phase)
+			}
+		}
+		result = append(result, entry)
+	}
+	return result
+}
+func buildPhaseWeightChanges(
+	boundaries []PhaseBoundary,
+	before, after phaseRun,
+	isolated map[string]struct{},
+) ([]PhaseWeightChange, []string) {
+	changes := make([]PhaseWeightChange, 0, len(boundaries))
+	affected := []string{}
+	for _, boundary := range boundaries {
+		phase := string(boundary.Phase)
+		weightBefore := before.phaseWeights[phase]
+		weightAfter := after.phaseWeights[phase]
+		change := PhaseWeightChange{
+			Phase: phase, WeightBefore: round6(weightBefore), WeightAfter: round6(weightAfter),
+			WeightReduction: round6(weightReductionRatio(weightBefore, weightAfter)),
+			ScoreBefore: round6(phaseScore(before, phase)), ScoreAfter: round6(phaseScore(after, phase)),
+			IsolatedChannels: []string{},
+		}
+		for channel := range isolated {
+			if _, scored := evidenceForPhase(before, phase).ChannelScores[channel]; scored {
+				change.IsolatedChannels = append(change.IsolatedChannels, channel)
+			}
+		}
+		sort.Strings(change.IsolatedChannels)
+		if len(change.IsolatedChannels) > 0 {
+			affected = append(affected, phase)
+		}
+		changes = append(changes, change)
+	}
+	return changes, affected
+}
+func phaseScore(run phaseRun, phase string) float64 {
+	evidence := evidenceForPhase(run, phase)
+	return evidence.WeightedDeviation
+}
+func evidenceForPhase(run phaseRun, phase string) PhaseEvidence {
+	for _, evidence := range run.evidence {
+		if evidence.Phase == phase {
+			return evidence
+		}
+	}
+	return PhaseEvidence{Phase: phase, ChannelScores: map[string]float64{}}
+}
+func totalChannelWeight(run phaseRun, channel string) float64 {
+	total := 0.0
+	for phase, weights := range run.channelWeights {
+		if _, scored := evidenceForPhase(run, phase).ChannelScores[channel]; scored {
+			total += weights[channel]
+		}
+	}
+	return total
+}
+func weightReductionRatio(before, after float64) float64 {
+	if before <= 0 {
+		return 0
+	}
+	return clamp((before - after) / before)
+}
+func buildExplanation(overall float64, level constants.DeviationLevel, phaseCount int, report IsolationReport) string {
+	if len(report.IsolatedChannels) == 0 {
+		return fmt.Sprintf(
+			"Deterministic phase-constrained DTW produced an overall deviation of %.3f (%s) across %d phases. "+
+				"Long gaps and missing values remain explicit; this result supports offline review only and contains no equipment control instructions.",
+			overall, level, phaseCount,
+		)
+	}
+	names := make([]string, 0, len(report.IsolatedChannels))
+	for _, channel := range report.IsolatedChannels {
+		names = append(names, fmt.Sprintf("%s (%.1f%% missing, weight -%.1f%%)",
+			channel.Channel, channel.MissingRate*100, channel.WeightReduction*100))
+	}
+	return fmt.Sprintf(
+		"Deterministic phase-constrained DTW quarantined %d channel(s) with missing rates above %.0f%% (%s); "+
+			"phase weights were recomputed from the %d remaining effective channels for an overall deviation of %.3f (%s) across %d phases. "+
+			"Pre- and post-isolation scores and weights are retained. This result supports offline review only and contains no equipment control instructions.",
+		len(report.IsolatedChannels), ChannelIsolationThreshold*100, strings.Join(names, "; "),
+		report.EffectiveChannelCount, overall, level, phaseCount,
+	)
 }
 func parseConfiguration(boundariesRaw, curvesRaw, toleranceRaw []byte) (
 	[]PhaseBoundary, map[string][]CurvePoint, map[string]ChannelTolerance, error,
@@ -238,18 +474,19 @@ func evaluatePhase(
 	boundary PhaseBoundary,
 	references map[string][]CurvePoint,
 	tolerances map[string]ChannelTolerance,
-) (PhaseEvidence, []AlignedPoint, map[string]string, float64, error) {
+	channelOrder []string,
+	excluded map[string]struct{},
+) (PhaseEvidence, []AlignedPoint, map[string]string, float64, map[string]float64, error) {
 	evidence := PhaseEvidence{Phase: string(boundary.Phase), ChannelScores: map[string]float64{}}
 	aligned := []AlignedPoint{}
 	causes := map[string]string{}
 	total, totalWeight := 0.0, 0.0
+	channelWeights := map[string]float64{}
 	durationScores, slopeScores, peakScores, distanceScores := []float64{}, []float64{}, []float64{}, []float64{}
-	channels := make([]string, 0, len(references))
-	for channel := range references {
-		channels = append(channels, channel)
-	}
-	sort.Strings(channels)
-	for _, channel := range channels {
+	for _, channel := range channelOrder {
+		if _, skip := excluded[channel]; skip {
+			continue
+		}
 		referenceAll := references[channel]
 		actualTimes, actualValues := actualInPhase(points, startedAt, boundary, channel)
 		referenceTimes, referenceValues := referenceInPhase(referenceAll, boundary)
@@ -261,7 +498,7 @@ func evaluatePhase(
 		referenceScaled := scaleValues(referenceValues, median, scale)
 		distance, path, err := DTW(actualScaled, referenceScaled, maxInt(len(actualScaled), len(referenceScaled))/2+1)
 		if err != nil {
-			return PhaseEvidence{}, nil, nil, 0, fmt.Errorf("align phase %s channel %s: %w", boundary.Phase, channel, err)
+			return PhaseEvidence{}, nil, nil, 0, nil, fmt.Errorf("align phase %s channel %s: %w", boundary.Phase, channel, err)
 		}
 		tolerance := tolerances[channel]
 		if tolerance.Weight <= 0 {
@@ -282,6 +519,7 @@ func evaluatePhase(
 		evidence.ChannelScores[channel] = round6(channelScore)
 		total += channelScore * tolerance.Weight
 		totalWeight += tolerance.Weight
+		channelWeights[channel] = tolerance.Weight
 		durationScores = append(durationScores, durationScore)
 		slopeScores = append(slopeScores, slopeScore)
 		peakScores = append(peakScores, peakScore)
@@ -300,14 +538,14 @@ func evaluatePhase(
 		}
 	}
 	if totalWeight == 0 {
-		return PhaseEvidence{}, nil, nil, 0, fmt.Errorf("phase %s has fewer than two comparable observations per channel", boundary.Phase)
+		return PhaseEvidence{}, nil, nil, 0, nil, fmt.Errorf("phase %s has no usable channel observations", boundary.Phase)
 	}
 	evidence.DurationDeviation = round6(mean(durationScores))
 	evidence.SlopeDeviation = round6(mean(slopeScores))
 	evidence.PeakTimeDeviation = round6(mean(peakScores))
 	evidence.CurveDistance = round6(mean(distanceScores))
 	evidence.WeightedDeviation = round6(total / totalWeight)
-	return evidence, aligned, causes, totalWeight, nil
+	return evidence, aligned, causes, totalWeight, channelWeights, nil
 }
 func actualInPhase(points []timeseries.Point, startedAt time.Time, boundary PhaseBoundary, channel string) ([]float64, []float64) {
 	times, values := []float64{}, []float64{}

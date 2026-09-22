@@ -27,6 +27,7 @@ type DeviationAnalysisResponse struct {
 	DeviationLevel       string                `json:"deviation_level"`
 	AlignedCurveJSON     json.RawMessage       `json:"aligned_curve_json"`
 	SuspectedCausesJSON  json.RawMessage       `json:"suspected_causes_json"`
+	IsolationReportJSON  json.RawMessage       `json:"isolation_report_json"`
 	AnalysisState        string                `json:"analysis_state"`
 	Explanation          string                `json:"explanation"`
 	AnalyzedAt           time.Time             `json:"analyzed_at"`
@@ -54,7 +55,8 @@ func NewDeviationAnalysisResponse(analysis model.DeviationAnalysis) DeviationAna
 		RecipeVersion: analysis.RecipeVersion, AlgorithmVersion: analysis.AlgorithmVersion,
 		InputHash: analysis.InputHash, PhaseScoresJSON: rawJSON(analysis.PhaseScoresJSON),
 		DeviationLevel: analysis.DeviationLevel, AlignedCurveJSON: rawJSON(analysis.AlignedCurveJSON),
-		SuspectedCausesJSON: rawJSON(analysis.SuspectedCausesJSON), AnalysisState: analysis.AnalysisState,
+		SuspectedCausesJSON: rawJSON(analysis.SuspectedCausesJSON),
+		IsolationReportJSON: rawJSON(analysis.IsolationReportJSON), AnalysisState: analysis.AnalysisState,
 		Explanation: analysis.Explanation, AnalyzedAt: analysis.AnalyzedAt,
 		InitiatedBy: analysis.InitiatedBy, InitiatedByName: analysis.InitiatedByName,
 		ReviewedBy: analysis.ReviewedBy, ReviewedByName: analysis.ReviewedByName,

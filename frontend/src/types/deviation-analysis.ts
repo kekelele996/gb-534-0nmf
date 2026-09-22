@@ -20,6 +20,32 @@ export interface AlignedPoint {
   reference_elapsed_h: number
   reference_value: number
 }
+export interface IsolatedChannel {
+  channel: string
+  missing_rate: number
+  weight_before: number
+  weight_after: number
+  weight_reduction: number
+  affected_phases: string[]
+}
+export interface PhaseWeightChange {
+  phase: string
+  weight_before: number
+  weight_after: number
+  weight_reduction: number
+  score_before: number
+  score_after: number
+  isolated_channels: string[]
+}
+export interface IsolationReport {
+  threshold: number
+  isolated_channels: IsolatedChannel[]
+  effective_channel_count: number
+  affected_phases: string[]
+  phase_weight_changes: PhaseWeightChange[]
+  overall_score_before: number
+  overall_score_after: number
+}
 export interface DeviationAnalysis {
   id: number
   sensor_series_id: number
@@ -31,6 +57,7 @@ export interface DeviationAnalysis {
   deviation_level: DeviationLevel
   aligned_curve_json: AlignedPoint[]
   suspected_causes_json: string[]
+  isolation_report_json: IsolationReport
   analysis_state: AnalysisState
   explanation: string
   analyzed_at: string

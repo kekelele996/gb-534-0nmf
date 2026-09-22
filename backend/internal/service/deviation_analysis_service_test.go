@@ -25,7 +25,7 @@ func TestAnalysisIdempotencyReviewerSeparationAndReplay(t *testing.T) {
 	now := time.Date(2026, 8, 20, 0, 0, 0, 0, time.UTC)
 	vessel := model.FermentationVessel{
 		VesselCode: "FV-A1", Name: "Analysis vessel", WorkingVolumeL: 100,
-		SensorChannels: `["ph"]`, Location: "Lab", OwnerTeam: "Process",
+		SensorChannels: `["ph","temperature"]`, Location: "Lab", OwnerTeam: "Process",
 		VesselState: "active", CommissionedAt: now, CreatedAt: now, UpdatedAt: now,
 	}
 	if err := vesselRepo.Create(context.Background(), &vessel); err != nil {
@@ -43,10 +43,11 @@ func TestAnalysisIdempotencyReviewerSeparationAndReplay(t *testing.T) {
 	}
 	points := make([]timeseries.Point, 0, 9)
 	for hour := 0; hour <= 8; hour++ {
-		value := 7 - float64(hour)*0.05
-		valueCopy := value
+		phValue := 7 - float64(hour)*0.05
+		tempValue := 30 + float64(hour)*0.1
 		points = append(points, timeseries.Point{
-			Timestamp: now.Add(time.Duration(hour) * time.Hour), Values: map[string]*float64{"ph": &valueCopy},
+			Timestamp: now.Add(time.Duration(hour) * time.Hour),
+			Values:    map[string]*float64{"ph": &phValue, "temperature": &tempValue},
 		})
 	}
 	pointsJSON, err := timeseries.EncodePoints(points)
@@ -54,7 +55,7 @@ func TestAnalysisIdempotencyReviewerSeparationAndReplay(t *testing.T) {
 		t.Fatal(err)
 	}
 	series := model.SensorSeries{
-		VesselID: vessel.ID, RecipeID: recipe.ID, RunCode: "RUN-A1", Channel: "ph",
+		VesselID: vessel.ID, RecipeID: recipe.ID, RunCode: "RUN-A1", Channel: "multichannel",
 		SampleIntervalS: 3600, PointsJSON: pointsJSON, StartedAt: now, EndedAt: now.Add(8 * time.Hour),
 		SourceChecksum: util.HashString(pointsJSON), SeriesState: "ready", QualitySummary: `{"valid":true}`,
 		NormalizationJSON: `{"method":"median_iqr"}`, ImportedBy: 9, ImportedByName: "analyst",

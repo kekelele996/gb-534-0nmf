@@ -231,6 +231,7 @@ func seedDomain(tx *gorm.DB, users map[string]model.User) error {
 		AlgorithmVersion: algorithm.Version, InputHash: inputHash, InputSnapshot: snapshotJSON,
 		PhaseScoresJSON: result.PhaseScoresJSON, DeviationLevel: string(result.DeviationLevel),
 		AlignedCurveJSON: result.AlignedCurveJSON, SuspectedCausesJSON: result.SuspectedCausesJSON,
+		IsolationReportJSON: result.IsolationReportJSON,
 		AnalysisState: string(constants.AnalysisCompleted), Explanation: result.Explanation,
 		AnalyzedAt: now.Add(-2 * time.Hour), InitiatedBy: analyst.ID, InitiatedByName: analyst.Username,
 		IdempotencyKey: "seed-analysis-001", DurationMilliseconds: 4,
